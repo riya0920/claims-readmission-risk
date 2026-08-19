@@ -2,8 +2,9 @@
 
 **This is not a deployable system.** It is the load-bearing part of one: the
 claims feature craft, the temporal discipline, and the intervention framing.
-The API, the fairness work, the monitoring, and the real data are not here, and
-[§ What is missing](#what-is-missing-the-other-80) says so specifically.
+The serving API, the fairness work beyond calibration, and the real data are
+not here, and [§ What is missing](#what-is-missing-the-other-80) says so
+specifically.
 
 Predicts unplanned 30-day readmission from synthetic payer claims, scored at
 the moment of discharge, and evaluates the result the way a care-management
@@ -18,11 +19,12 @@ python worklist.py --capacity 500         # the care-manager artefact
 python -m pytest tests -q                 # 20 tests, all about not cheating
 ```
 
-Everything runs offline. Runtime end to end is about six minutes.
+Everything runs offline. Runtime end to end is about ten minutes, most of
+it the bootstrap.
 
 ---
 
-## The four things worth reading
+## The six things worth reading
 
 ### 1. Claims fluency, in the features rather than the README
 
