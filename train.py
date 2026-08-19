@@ -40,9 +40,11 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 import features as F
+import uncertainty as U
 from generate import TRUE_COEF, WINDOW_END
 
 OUT = "out"
+BOOT = 600      # bootstrap replicates; 600 is enough for 3-dp percentile CIs
 
 # ---------------------------------------------------------------------------
 # Economic assumptions. Every one of these is an ASSUMPTION, is named as such,
@@ -217,6 +219,63 @@ def main(datadir="data"):
     print(f"\nGBM minus logistic:  AUROC {d_auc:+.4f}   "
           f"sensitivity@5% {d_sens:+.1%}")
 
+    # ---- uncertainty -------------------------------------------------------
+    print("\n" + "=" * 78)
+    print("CONFIDENCE INTERVALS (cluster bootstrap, resampled by MEMBER)")
+    print("=" * 78)
+    print("  Resampling is by member, not by stay: a member can contribute")
+    print("  several index admissions and they are correlated, so resampling")
+    print("  rows independently would treat them as independent evidence and")
+    print("  produce intervals that are too narrow.")
+    print()
+    groups = U.ClusterIndex(te.member_id.values)   # built once, reused
+    ci = {}
+    print(f"  {'metric':<16}{'logistic':>28}{'gradient boosting':>28}")
+    for metric in ("auroc", "auprc", "brier", "sens_at_5pct", "ppv_at_5pct"):
+        a = U.bootstrap_ci(yte, p_logit, groups, metric, n_boot=BOOT, seed=1)
+        b = U.bootstrap_ci(yte, p_gbm, groups, metric, n_boot=BOOT, seed=1)
+        ci[metric] = {"logistic": a, "gbm": b}
+        fmt = (lambda v: f"{v:.1%}") if metric.endswith("5pct") else (lambda v: f"{v:.4f}")
+        print(f"  {metric:<16}"
+              f"{fmt(a['point']) + ' (' + fmt(a['lo']) + '-' + fmt(a['hi']) + ')':>28}"
+              f"{fmt(b['point']) + ' (' + fmt(b['lo']) + '-' + fmt(b['hi']) + ')':>28}")
+
+    print("\n" + "=" * 78)
+    print("IS THE DIFFERENCE REAL? PAIRED BOOTSTRAP ON THE DIFFERENCE")
+    print("=" * 78)
+    print("  NOT by checking whether the two intervals above overlap. Both")
+    print("  models are scored on the SAME patients, so their errors are")
+    print("  correlated and the difference is far more stable than either")
+    print("  level. Comparing intervals systematically understates evidence")
+    print("  for a difference; bootstrapping the difference does not.")
+    print()
+    print(f"  {'metric':<16}{'logistic - GBM':>18}{'95% CI':>22}{'p':>9}"
+          f"   {'verdict'}")
+    comparisons = {}
+    for metric in ("auroc", "auprc", "sens_at_5pct"):
+        d = U.paired_bootstrap_difference(yte, p_logit, p_gbm, groups, metric,
+                                          n_boot=BOOT, seed=2)
+        comparisons[metric] = d
+        fmt = (lambda v: f"{v:+.1%}") if metric.endswith("5pct") else (lambda v: f"{v:+.4f}")
+        verdict = "DISTINGUISHABLE" if d["significant"] else "indistinguishable"
+        print(f"  {metric:<16}{fmt(d['difference']):>18}"
+              f"{'(' + fmt(d['lo']) + ', ' + fmt(d['hi']) + ')':>22}"
+              f"{d['p_value']:>9.3f}   {verdict}")
+
+    mdd = U.minimum_detectable_difference(yte, p_logit, groups, "auroc",
+                                          n_boot=BOOT, seed=3)
+    print(f"\n  Smallest AUROC difference this test set could resolve: "
+          f"~{mdd['approx_min_detectable']:.4f}")
+    print(f"  Observed difference: {abs(d_auc):.4f}")
+    if abs(d_auc) < mdd["approx_min_detectable"]:
+        print("  The observed gap is SMALLER than the resolution of the")
+        print("  evaluation. This comparison was never going to settle")
+        print("  anything, and running it and picking a winner would have been")
+        print("  theatre. The recommendation to ship logistic rests on")
+        print("  transparency, not on the AUROC.")
+    else:
+        print("  The observed gap exceeds the resolution of the evaluation.")
+
     # ---- calibration table -------------------------------------------------
     best_name, best_p = ("gbm", p_gbm) if d_sens >= 0 else ("logistic", p_logit)
     ct = calibration_table(yte, best_p)
@@ -374,6 +433,9 @@ def main(datadir="data"):
               f"net ${net:>+11,.0f}")
 
     payload = {
+        "confidence_intervals": ci,
+        "model_comparison": comparisons,
+        "minimum_detectable_difference": mdd,
         "cohort_waterfall": counts,
         "split": {"cut": str(cut.date()), "train": len(tr), "test": len(te),
                   "member_overlap": overlap},

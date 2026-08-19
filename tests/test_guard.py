@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 import codes as C
 import comorbidity as CM
 import features as F
+import uncertainty as U
 from features import ClaimsView, TemporalViolation
 
 
@@ -235,3 +236,79 @@ def test_gap_days_feature_is_populated_for_churning_members(world):
                          churn, members)
     assert int(f.elig_gap_days_365d.iloc[0]) == 36
     assert int(f.any_elig_gap_365d.iloc[0]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty
+# ---------------------------------------------------------------------------
+def test_cluster_index_partitions_every_row_exactly_once():
+    groups = np.array(["a", "b", "a", "c", "b", "a"])
+    idx = U.ClusterIndex(groups)
+    assert idx.n_groups == 3
+    allrows = np.sort(np.concatenate(idx.rows_by_group))
+    assert list(allrows) == list(range(len(groups)))
+
+
+def test_cluster_resample_keeps_members_intact():
+    """The whole point: a member's rows travel together, so correlated stays
+    are never treated as independent evidence."""
+    groups = np.array(["a", "a", "a", "b", "c"])
+    idx = U.ClusterIndex(groups)
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        rows = idx.resample(rng)
+        picked = groups[rows]
+        # every appearance of 'a' comes in a block of 3
+        assert (picked == "a").sum() % 3 == 0
+
+
+def test_clustered_interval_is_wider_than_the_naive_one():
+    """Ignoring clustering understates uncertainty. If this ever fails, the
+    clustering is not doing anything and the intervals are too narrow."""
+    rng = np.random.default_rng(3)
+    n_members, per = 300, 4
+    groups = np.repeat([f"m{i}" for i in range(n_members)], per)
+    member_effect = rng.normal(0, 1.2, n_members).repeat(per)
+    y = (rng.random(n_members * per) < 0.2).astype(int)
+    p = 1 / (1 + np.exp(-(member_effect + y * 0.8)))
+    clustered = U.bootstrap_ci(y, p, groups, "auroc", n_boot=200, seed=1)
+    naive = U.bootstrap_ci(y, p, np.arange(len(y)).astype(str), "auroc",
+                           n_boot=200, seed=1)
+    assert (clustered["hi"] - clustered["lo"]) > (naive["hi"] - naive["lo"])
+
+
+def test_paired_difference_detects_a_genuinely_better_model():
+    rng = np.random.default_rng(5)
+    n = 3000
+    groups = np.arange(n).astype(str)
+    y = (rng.random(n) < 0.3).astype(int)
+    good = np.clip(y * 0.5 + rng.normal(0.3, 0.15, n), 0.001, 0.999)
+    bad = np.clip(y * 0.05 + rng.normal(0.3, 0.15, n), 0.001, 0.999)
+    d = U.paired_bootstrap_difference(y, good, bad, groups, "auroc",
+                                      n_boot=200, seed=1)
+    assert d["difference"] > 0
+    assert d["significant"] is True
+    assert d["p_value"] < 0.05
+
+
+def test_paired_difference_finds_nothing_between_identical_models():
+    rng = np.random.default_rng(7)
+    n = 1500
+    groups = np.arange(n).astype(str)
+    y = (rng.random(n) < 0.25).astype(int)
+    p = np.clip(y * 0.3 + rng.normal(0.3, 0.2, n), 0.001, 0.999)
+    d = U.paired_bootstrap_difference(y, p, p.copy(), groups, "auroc",
+                                      n_boot=100, seed=1)
+    assert d["difference"] == 0.0
+    assert d["significant"] is False
+
+
+def test_point_estimate_lies_inside_its_own_interval():
+    rng = np.random.default_rng(11)
+    n = 1200
+    groups = np.repeat([f"m{i}" for i in range(300)], 4)
+    y = (rng.random(n) < 0.2).astype(int)
+    p = np.clip(y * 0.4 + rng.normal(0.25, 0.2, n), 0.001, 0.999)
+    for metric in ("auroc", "auprc", "brier", "sens_at_5pct", "ppv_at_5pct"):
+        ci = U.bootstrap_ci(y, p, groups, metric, n_boot=150, seed=2)
+        assert ci["lo"] <= ci["point"] <= ci["hi"], metric
