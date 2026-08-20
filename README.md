@@ -1,10 +1,11 @@
-# ML-1 — Claims-based readmission risk (~50% build)
+# ML-1 — Claims-based readmission risk (~80% build)
 
-**This is still not a deployable system.** It is the load-bearing part of one: the
-claims feature craft, the temporal discipline, and the intervention framing.
-The serving API, the fairness work beyond calibration, and the real data are
-not here, and [§ What is missing](#what-is-missing-the-other-80) says so
-specifically.
+**This is still not a deployable system.** It is the load-bearing part of one:
+the claims feature craft, the temporal discipline, the intervention framing,
+and now a scoring service with a model registry that refuses to serve on a
+schema mismatch. The fairness work beyond calibration, the real data, and every
+operational commitment that makes a model safe rather than merely correct are
+not here, and [§ What is missing](#what-is-still-missing) says so specifically.
 
 Predicts unplanned 30-day readmission from synthetic payer claims, scored at
 the moment of discharge, and evaluates the result the way a care-management
@@ -14,9 +15,12 @@ programme is actually run: at capacity.
 python src/generate.py --members 50000    # ~4 min, writes data/
 python train.py                           # models, calibration, subgroups, economics, CIs
 python leakage_audit.py                   # 3 experiments -> docs/LEAKAGE_AUDIT.md
-python monitor.py                         # drift panels -> out/drift.json
+python monitor.py                         # drift panels + an injected failure
 python worklist.py --capacity 500         # the care-manager artefact
-python -m pytest tests -q                 # 20 tests, all about not cheating
+python serve.py --register                # fit and register a servable artefact
+python serve.py --demo                    # exercise the API end to end
+python serve.py                           # scoring service on :8081
+python -m pytest tests -q                 # 67 tests, all about not cheating
 ```
 
 Everything runs offline. Runtime end to end is about ten minutes, most of
@@ -24,7 +28,7 @@ it the bootstrap.
 
 ---
 
-## The six things worth reading
+## The seven things worth reading
 
 ### 1. Claims fluency, in the features rather than the README
 
@@ -158,7 +162,7 @@ would have been theatre. The recommendation to ship logistic rests on
 transparency, not on the AUROC — which is what the first build claimed, now
 with the arithmetic to back it.
 
-### 5. Drift monitoring, instrumented rather than described
+### 5. Drift monitoring, and a monitor that was made to fail
 
 `CLINICAL_VALIDATION.md` lists seven failure modes and how each would be
 detected. `monitor.py` implements the detection, on the principle that
@@ -169,16 +173,54 @@ April.
 
 Four panels: per-feature PSI against the training reference; **claim-runout lag
 by quarter** (the canary — a clearinghouse change shifts every recency feature
-at once and the model cannot see it); prediction distribution; and the **cohort
+at once and the model cannot see it); calibration O/E overall and for the
+coverage-gap stratum the validation doc pre-specified; and the **cohort
 waterfall itself**, because a contract change that alters who gets admitted
 moves the denominator without touching a single model metric.
 
-It found something on the first run: `elig_gap_days_365d` drifts hard
-(PSI 0.196, mean −87%). That is a **boundary artefact** — coverage gaps fall
-inside a fixed data window, so discharges late in the window have fewer gaps in
-their 365-day lookback. Distinguishing an artefact from real drift is the whole
-skill; the panel reports the mean change beside the PSI precisely so that call
-can be made.
+All four are green on this data, by construction — the generator uses one lag
+distribution throughout. **A dashboard that has only ever shown green is not
+evidence that the monitor works.** So the panel injects a +21-day clearinghouse
+shift and makes the detectors catch it, which produced the most useful result
+in the project:
+
+| what moved | PSI |
+|---|---|
+| the receipt-lag distribution itself | **6.06** |
+| `office_visits_90d` (worst affected feature) | 0.036 |
+| `ed_visits_90d` | 0.015 |
+| `ip_admits_365d` | 0.0008 |
+
+**The per-feature PSI does not catch it.** The worst feature lands ~7× below
+the 0.25 "investigate" threshold and below the 0.10 "watch" threshold too. A
+standard PSI dashboard would have shown all green through a train/serve skew
+severe enough to change what the recency features *mean* — the exact failure
+`docs/LEAKAGE_AUDIT.md` measures. Monitoring the mechanism answers 168× louder
+than monitoring the symptom, and that ratio was measured here rather than
+asserted.
+
+Two bugs the monitoring code found in itself, both of which are the reassuring
+kind:
+
+- **PSI silently returned 0.0 on zero-inflated features.** Most utilisation
+  features here are counts that are 85–99% zero. Every decile edge lands on 0,
+  the edges deduplicate to one, and the natural implementation reports "no
+  shift" for a feature whose mass point could have moved from 85% to 99%.
+  `psi()` now has a discrete-bin path and a mass-point fallback. Found by a
+  test, not by reading the code.
+- **A waterfall stage retained 117% of what it received**, and got written up
+  as a real conditional effect before anyone checked the arithmetic. That came
+  from a simulation that scaled stages independently. `cohort_drift()` now
+  refuses any retention above 100% outright. Monitoring code needs its own
+  sanity checks: a plausible number from an impossible computation is the
+  easiest thing in this project to believe.
+
+There is also a real drift finding: `elig_gap_days_365d` moves hard (PSI 0.196,
+mean −87%), and it is a **boundary artefact** — coverage gaps fall inside a
+fixed data window, so discharges late in the window have fewer gaps in their
+365-day lookback. Distinguishing an artefact from real drift is the whole
+skill; the panel reports the mean change beside the PSI so that call can be
+made.
 
 The doc is also explicit about what monitoring **cannot** see: the feedback
 loop (once outreach works, the labels stop describing the untreated population
@@ -194,6 +236,49 @@ miscalibration, what synthetic data cannot tell us, seven named failure modes
 including the feedback loop that degrades the model's own training labels, and
 what a real deployment would require — silent-mode trial, randomised holdout,
 IRB/QI determination, named clinical owner with the authority to switch it off.
+
+### 7. A service that refuses to answer
+
+`serve.py` is a stdlib HTTP scoring service — `GET /health`, `GET /model`,
+`GET /worklist?as_of=…&capacity=N`, `POST /score`. The interesting parts are
+the three places it declines.
+
+**It refuses without an explicit `as_of`.** Both scoring routes return 400
+rather than defaulting to "now". This is the whole project's thesis expressed
+as a status code: a worklist is a snapshot of what had been *received* at a
+moment, and silently defaulting the clock reintroduces exactly the train/serve
+skew `docs/LEAKAGE_AUDIT.md` measures.
+
+**It refuses on a feature-schema mismatch.** `src/registry.py` stores every
+model with the ordered feature list it was fitted on, an order-*sensitive*
+hash, the visibility mode (`received` vs complete history), and the metrics
+with their intervals. `load()` returns a `ServableModel` that raises
+`SchemaMismatch` rather than score. The case that justifies the hash is not a
+missing column — it is the **same columns in a different order**, where a set
+comparison passes, nothing raises, and `charlson` is scored through the
+coefficient for `age`. That case has its own test and its own error message.
+
+**Every response carries its own intended use**, including the sentence saying
+the score must not be used to deny, delay, limit or price coverage, and that
+members *not* returned have not been cleared of risk. Governance that lives
+only in a README is governance the integrating team never reads.
+
+Two bugs came out of running the service rather than reading it:
+
+- **`/worklist` was scoring the training data.** The first version returned
+  every discharge up to `as_of` — 23,402 stays — with a top risk of 98.4%.
+  Those were in-sample fits being served as predictions. Fixed with a 30-day
+  window (matching the outcome window, and matching what transitional-care
+  outreach can actually act on) plus a per-row `in_training_set` flag and a
+  response-level warning for any window that reaches back past the training
+  cut.
+- **An empty window returned a different response shape**, so a client reading
+  `cohort_size` got a `KeyError` on a quiet day instead of a zero. An empty
+  result is a normal answer and has to have a normal shape.
+
+The 20 API tests start a real server on an ephemeral port and talk to it over
+HTTP, because routing, status codes and JSON encoding are part of what is being
+claimed and calling the handler methods in-process tests none of them.
 
 ---
 
@@ -221,8 +306,20 @@ away.
 Named specifically, because a list of what a project does is only half of an
 honest one.
 
-- **No serving API.** `worklist.py` writes a CSV. There is no scoring service,
-  no batch scheduler, no model registry, no versioning of a deployed artefact.
+- **The registry is not a registry.** `src/registry.py` is the minimum that
+  makes serving honest: an artefact bound to its feature contract. It is not
+  MLflow — no experiment tracking, no artefact store, no lineage back to the
+  training run, no staging/production promotion, no approval gates, and nothing
+  stopping someone registering v2 over v1.
+- **The service is single-process and unauthenticated.** One stdlib
+  `HTTPServer`, no auth, no rate limiting, no TLS, no request audit log — and
+  an unauthenticated endpoint returning member-level risk scores is a HIPAA
+  incident waiting to happen. `se1-hl7-fhir-interop` in this portfolio has the
+  append-only PHI access audit this service should be writing to; they are not
+  wired together.
+- **No batch path.** Scoring is per-request. A real programme scores every
+  discharge overnight and hands the care team a queue in the morning, which is
+  a scheduler and a job table, not an API.
 - **No SHAP.** Not installed offline. Reason codes use occlusion-vs-median,
   documented at length in `worklist.py` as *not SHAP* — not additive, blind to
   interactions, no efficiency guarantee. Anything a member could appeal needs
@@ -237,9 +334,12 @@ honest one.
   bias that claims bake in are not addressed. The last is not fixable here at
   all — this generator has no access-inequity mechanism, so the analysis has
   nothing to find.
-- **No monitoring *deployment*.** `monitor.py` computes the panels; there is no
-  scheduler, no alerting, no thresholds agreed with an owner, and no runbook
-  saying who does what when a panel goes red.
+- **No monitoring *deployment*.** `monitor.py` computes the panels and
+  `run_all()` emits alert strings; there is no scheduler, no alert *delivery*,
+  no thresholds agreed with a named owner, and no runbook saying who does what
+  when one fires. The thresholds in the code are credit-scoring rules of thumb
+  I chose, which is precisely the part that has to be negotiated with the
+  people who will be paged.
 - **No competing-risk handling.** Death after discharge censors the outcome and
   is treated here only by excluding in-hospital deaths. Post-discharge mortality
   is not modelled, which biases the 30-day label in the sickest stratum.
@@ -261,5 +361,10 @@ honest one.
 | `leakage_audit.py` | three experiments → `docs/LEAKAGE_AUDIT.md` |
 | `worklist.py` | ranked worklist, plain-English drivers, the capacity conversation |
 | `src/uncertainty.py` | cluster bootstrap, paired model comparison, minimum detectable difference |
-| `monitor.py` | PSI, runout-lag, prediction and cohort drift panels |
+| `src/monitor.py` | drift detectors: PSI (with the zero-inflation fix), calibration, runout, cohort |
+| `monitor.py` | the drift dashboard, plus the injected clearinghouse failure |
+| `src/registry.py` | model + feature contract; refuses to serve on a schema mismatch |
+| `serve.py` | stdlib scoring API; `--register` to fit, `--demo` to exercise |
 | `tests/test_guard.py` | 20 tests: not cheating, and not overstating precision |
+| `tests/test_serving.py` | 27 tests: the feature contract and the drift detectors |
+| `tests/test_api.py` | 20 tests: the refusals, the windowing, the in-sample flag |
