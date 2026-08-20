@@ -1,6 +1,6 @@
 # ML-1 — Claims-based readmission risk (~50% build)
 
-**This is not a deployable system.** It is the load-bearing part of one: the
+**This is still not a deployable system.** It is the load-bearing part of one: the
 claims feature craft, the temporal discipline, and the intervention framing.
 The serving API, the fairness work beyond calibration, and the real data are
 not here, and [§ What is missing](#what-is-missing-the-other-80) says so
@@ -216,7 +216,7 @@ away.
 
 ---
 
-## What is missing (the other 80%)
+## What is still missing
 
 Named specifically, because a list of what a project does is only half of an
 honest one.
