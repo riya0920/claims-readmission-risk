@@ -1,4 +1,4 @@
-# ML-1 — Claims-based readmission risk (~80% build)
+# ML-1 — Claims-based readmission risk — complete
 
 **This is still not a deployable system.** It is the load-bearing part of one:
 the claims feature craft, the temporal discipline, the intervention framing,
@@ -20,7 +20,8 @@ python worklist.py --capacity 500         # the care-manager artefact
 python serve.py --register                # fit and register a servable artefact
 python serve.py --demo                    # exercise the API end to end
 python serve.py                           # scoring service on :8081
-python -m pytest tests -q                 # 67 tests, all about not cheating
+python run_batch.py                       # overnight batch + fairness report
+python -m pytest tests -q                 # 100 tests, all about not cheating
 ```
 
 Everything runs offline. Runtime end to end is about ten minutes, most of
@@ -301,53 +302,143 @@ away.
 
 ---
 
-## What is still missing
+## The batch path, and what a rerun must not do
 
-Named specifically, because a list of what a project does is only half of an
-honest one.
+`src/batch.py` + `run_batch.py`. The gap list said scoring was per-request and
+"a real programme scores every discharge overnight and hands the care team a
+queue in the morning, which is a scheduler and a job table, not an API."
 
-- **The registry is not a registry.** `src/registry.py` is the minimum that
-  makes serving honest: an artefact bound to its feature contract. It is not
-  MLflow — no experiment tracking, no artefact store, no lineage back to the
-  training run, no staging/production promotion, no approval gates, and nothing
-  stopping someone registering v2 over v1.
-- **The service is single-process and unauthenticated.** One stdlib
-  `HTTPServer`, no auth, no rate limiting, no TLS, no request audit log — and
-  an unauthenticated endpoint returning member-level risk scores is a HIPAA
-  incident waiting to happen. `se1-hl7-fhir-interop` in this portfolio has the
-  append-only PHI access audit this service should be writing to; they are not
-  wired together.
-- **No batch path.** Scoring is per-request. A real programme scores every
-  discharge overnight and hands the care team a queue in the morning, which is
-  a scheduler and a job table, not an API.
-- **No SHAP.** Not installed offline. Reason codes use occlusion-vs-median,
-  documented at length in `worklist.py` as *not SHAP* — not additive, blind to
+A batch is not the API in a loop. Everything interesting about it is what
+happens the **second** time:
+
+- **A rerun of an identical job returns the ORIGINAL result.** A batch fails at
+  03:00 and someone reruns it at 06:00; if the run is not idempotent the team
+  gets two queues that disagree and no way to tell which one to work. Jobs are
+  keyed on `(model, version, as_of, lookback, capacity, cohort_hash)`.
+- **The cohort is part of the key.** Keying on `(model, as_of)` alone would
+  return yesterday's answer after a late claim changed the population — the
+  opposite failure from duplicates, and much harder to notice.
+- **A job is succeeded or it is nothing.** The queue is written in one
+  transaction. A job that dies after scoring 4,000 of 5,000 discharges must not
+  leave 4,000 rows readable as a worklist: the team would work a queue silently
+  missing the sickest fifth of the population, with nothing about it saying so.
+- **Coverage is recorded** — who was actually called, against the queue that
+  told them to call. On the demo run: **50 queued, 18 worked, 36% coverage**. A
+  model with excellent sensitivity attached to a queue nobody works delivers
+  nothing, and that failure is invisible in every metric `train.py` reports.
+
+## Fairness beyond calibration — and a real gap in the model
+
+`src/fairness.py`. The threshold comes from **capacity** (top 5%), not 0.5;
+evaluating parity at 0.5 measures a decision rule nobody runs.
+
+| group | n | prevalence | selected | TPR | FPR | **FNR** | PPV |
+|---|---|---|---|---|---|---|---|
+| 65+ | 3,134 | 20.8% | 10.3% | 20.2% | 7.7% | **79.8%** | 40.7% |
+| under 65 | 5,692 | 14.3% | 2.1% | 5.5% | 1.5% | **94.5%** | 38.1% |
+
+**A 14.7-point false-negative gap**, and the FNR is the criterion that matters
+here: this model only *adds* outreach, so a false positive costs a phone call
+and a false negative costs a member the call.
+
+The module computes all three fairness criteria and **reports the conflict**.
+Prevalence differs by 6.5 points across groups, so calibration, equalised odds
+and equal selection cannot all hold (Kleinberg et al. 2016; Chouldechova 2016).
+The impossibility is *checked* rather than asserted — citing a theorem whose
+premise was never verified is its own error, and with equal prevalence it has
+no force.
+
+`recommend_criterion()` returns a criterion **plus the deployment assumption it
+rests on**, and inverts if the score ever gates a benefit. That is the same
+argument `docs/CLINICAL_VALIDATION.md` makes for the safety case: the property
+belongs to the deployment, not the model.
+
+Calibration within groups holds (max band gap 0.023 and 0.016) — reported
+anyway, because "we did not check" and "we checked and it held" are different
+claims and only one survives a question.
+
+## Alerting with a named owner, and a runbook that is generated
+
+`src/alerting.py` → [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Delivery is ten lines;
+the agreement underneath it is the part that was missing. Every alert carries an
+owner who can act, a severity, a one-line instruction written for someone
+reading it at 03:00, and a `silence_if`.
+
+**That last field keeps the system alive.** `monitor.py` already found that
+`elig_gap_days_365d` drifts hard (PSI 0.196) for a boundary artefact — real,
+correct and permanent. An alert firing every run for a known reason trains its
+audience to mute the channel, and then the one that matters arrives muted.
+
+Only two alerts page, and **the most important one is for something *not*
+happening**: the batch producing no queue. `monitor.py` cannot detect its own
+failure to run, so that check is marked `external: True` rather than
+implemented — a monitoring system whose absence is silent is not a control.
+
+A cohort alert routes to the **programme manager, not data science**: a stage
+whose retention moves is a population change, and sending it to the model owner
+sends it to someone who cannot fix it.
+
+## The service now authenticates, and logs who saw whom
+
+The gap list called the unauthenticated endpoint "a HIPAA incident waiting to
+happen". It is now behind a bearer token, with `/health` exempt — a load
+balancer probing it holds no credential, and it returns no member data, which
+is the only reason exempting it is safe.
+
+**The access log is the half that matters.** Authentication answers "may you
+ask"; only the log answers "which members were disclosed, to whom, when", and
+that is the question an investigation asks. Denied attempts are logged too. A
+consequence worth stating: the log contains member ids, so *the log is PHI*,
+with the same handling requirements as the scores.
+
+## What is still missing, and why it cannot be closed here
+
+Everything below needs something this environment does not have. The gaps that
+were closeable have been closed; these are named with the specific blocker
+rather than left as a to-do.
+
+- **No real Synthea.** Not installed, no network. `src/generate.py` writes
+  claims-shaped data directly, so the trajectories come from a risk equation I
+  wrote — which is what makes recovery checkable and also what makes the
+  clinical realism unearned.
+- **No SHAP.** Not installed. Reason codes use occlusion-vs-median, documented
+  at length in `worklist.py` as *not SHAP* — not additive, blind to
   interactions, no efficiency guarantee. Anything a member could appeal needs
   real Shapley values.
-- **No real Synthea.** `src/generate.py` writes claims-shaped data directly.
-  The docstring states what that costs: Synthea's trajectories come from curated
-  disease modules with published provenance; these come from a risk equation I
-  wrote, which is what makes recovery checkable and also what makes the
-  clinical realism unearned.
-- **No fairness analysis beyond calibration.** Subgroup O/E and AUROC are
-  reported; equalised odds, calibration-within-groups over time, and the access
-  bias that claims bake in are not addressed. The last is not fixable here at
-  all — this generator has no access-inequity mechanism, so the analysis has
-  nothing to find.
-- **No monitoring *deployment*.** `monitor.py` computes the panels and
-  `run_all()` emits alert strings; there is no scheduler, no alert *delivery*,
-  no thresholds agreed with a named owner, and no runbook saying who does what
-  when one fires. The thresholds in the code are credit-scoring rules of thumb
-  I chose, which is precisely the part that has to be negotiated with the
-  people who will be paged.
+- **No MLflow or artefact store.** `src/registry.py` is the minimum that makes
+  serving honest — an artefact bound to its feature contract. No experiment
+  tracking, no lineage to the training run, no staging/production promotion, no
+  approval gates.
+- **No scheduler.** `run_batch.py` runs one job when invoked; something else
+  has to invoke it, and "the batch did not run at all" is the failure that most
+  needs monitoring. It is in the policy table as `external: True` precisely
+  because it cannot live here.
+- **Access bias is not analysable with this data, and the reason is not that
+  the analysis is missing.** Claims measure care *received*, so a population
+  with worse access looks healthier to any model fitted on claims. But
+  `src/generate.py` has no access-inequity mechanism — every member's
+  utilisation is drawn from their true risk. An analysis reporting "no access
+  bias detected" would be reporting a property of the generator and passing it
+  off as a property of the model. Detecting it needs an external measure of
+  health that does not come through the claims pipeline, which is a
+  data-acquisition problem.
 - **No competing-risk handling.** Death after discharge censors the outcome and
-  is treated here only by excluding in-hospital deaths. Post-discharge mortality
-  is not modelled, which biases the 30-day label in the sickest stratum.
+  is handled only by excluding in-hospital deaths. Post-discharge mortality is
+  not in the generator, so as with access bias there is nothing here to
+  recover; `data3-trial-survival` in this portfolio has the Aalen-Johansen and
+  Fine-Gray machinery this would need.
+- **Single-node, single-process.** No TLS, no rate limiting, no connection
+  pooling. The bearer token authenticates a caller, not a user, and
+  `se1-hl7-fhir-interop` has the SMART scope layer and append-only audit this
+  service should really write to. They are not wired together.
 - **No hyperparameter search and no cross-validated model selection.** The
-  models are compared at fixed settings; a real bake-off tunes both.
+  models are compared at fixed settings. Deliberate rather than blocked: § 4
+  showed the observed gap is smaller than the evaluation can resolve, so tuning
+  would produce a more precise answer to a question the data cannot settle.
 - **The grey-zone feature is unresolved.** Index principal diagnosis is used as
   though known at discharge; in reality the final coded diagnosis is assigned
-  days later during coding. `features.py` flags this rather than fixing it.
+  days later during coding. `features.py` flags this rather than fixing it,
+  because fixing it needs a coding-lag distribution the generator does not have.
 
 ## Files
 
@@ -365,6 +456,12 @@ honest one.
 | `monitor.py` | the drift dashboard, plus the injected clearinghouse failure |
 | `src/registry.py` | model + feature contract; refuses to serve on a schema mismatch |
 | `serve.py` | stdlib scoring API; `--register` to fit, `--demo` to exercise |
+| `src/batch.py` | job table, idempotent reruns, all-or-nothing queue writes |
+| `src/fairness.py` | error-rate parity, the impossibility check, the criterion choice |
+| `src/alerting.py` | thresholds with owners and silence rules; generates the runbook |
+| `run_batch.py` | the overnight batch, and the fairness report |
+| `docs/RUNBOOK.md` | generated from the policy, so the two cannot drift |
+| `tests/test_complete.py` | 33 tests: reruns, partial failure, parity, alert routing, auth |
 | `tests/test_guard.py` | 20 tests: not cheating, and not overstating precision |
 | `tests/test_serving.py` | 27 tests: the feature contract and the drift detectors |
 | `tests/test_api.py` | 20 tests: the refusals, the windowing, the in-sample flag |

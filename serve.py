@@ -43,6 +43,7 @@ Run:  python serve.py --register     # train, register v1, exit
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import sys
@@ -129,6 +130,63 @@ def warm(version=1, datadir="data"):
     return servable
 
 
+# ---------------------------------------------------------------------------
+# access control
+# ---------------------------------------------------------------------------
+# THE README CALLED THIS "a HIPAA incident waiting to happen", and it was
+# right: an unauthenticated endpoint returning member-level risk scores is a
+# bulk PHI disclosure to anyone who can reach the port.
+#
+# What is here is deliberately minimal -- a shared bearer token and an access
+# log. It authenticates the CALLER, not a user, and it is not an identity
+# system; se1-hl7-fhir-interop in this portfolio has the SMART scope layer and
+# the append-only audit this service should really be writing to. The point of
+# adding it is that "no auth at all" and "auth a reviewer can criticise" are
+# different states, and only the second one is a starting position.
+
+class _Access:
+    """Bearer-token check plus an access log that records WHO SAW WHOM.
+
+    The log is the half that matters. Authentication answers "may you ask";
+    only the log answers "which members were disclosed, to whom, when" -- and
+    that second question is the one an OCR investigation asks. A service that
+    authenticates and does not log has a control and no evidence.
+
+    Member ids are recorded because that is the point of the log. That makes
+    the log itself PHI, with the same handling requirements as the scores --
+    which is a real consequence and is why it is a bounded in-memory list here
+    rather than something written to disk beside the code.
+    """
+
+    def __init__(self, token=None, limit=5000):
+        self.token = token
+        self.records = []
+        self.limit = limit
+
+    def check(self, header):
+        if self.token is None:
+            return True, None
+        if not header or not header.startswith("Bearer "):
+            return False, "no bearer token"
+        if not hmac.compare_digest(header[7:], self.token):
+            return False, "token does not match"
+        return True, None
+
+    def log(self, *, route, caller, as_of, member_ids, outcome):
+        rec = {"at": time.time(), "route": route, "caller": caller,
+               "as_of": str(as_of), "n_members": len(member_ids),
+               "member_ids": list(member_ids)[:200], "outcome": outcome}
+        self.records.append(rec)
+        del self.records[:-self.limit]
+        return rec
+
+    def who_saw(self, member_id):
+        return [r for r in self.records if member_id in r["member_ids"]]
+
+
+ACCESS = _Access()
+
+
 INTENDED_USE = (
     "Ranks discharges by modelled probability of an unplanned readmission "
     "CLAIM within 30 days, to order a capacity-bound outreach queue. This is "
@@ -156,10 +214,33 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # -- GET ------------------------------------------------------------
+    def _authorised(self, route):
+        """401 unless the caller presents the token. /health is exempt.
+
+        /health is exempt on purpose: a load balancer probing it does not hold
+        a credential, and requiring one there means the probe fails and the
+        service is removed from rotation while working perfectly. It returns no
+        member data, which is the only reason exempting it is safe.
+        """
+        ok, why = ACCESS.check(self.headers.get("Authorization"))
+        if ok:
+            return True
+        ACCESS.log(route=route, caller="<unauthenticated>", as_of=None,
+                   member_ids=[], outcome=f"denied: {why}")
+        self._send(401, {"error": "authentication required",
+                         "detail": why,
+                         "why": ("this endpoint returns member-level risk "
+                                 "scores. Unauthenticated access to it is a "
+                                 "bulk PHI disclosure.")})
+        return False
+
     def do_GET(self):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         model = _STATE["model"]
+
+        if url.path not in ("/health",) and not self._authorised(url.path):
+            return
 
         if url.path == "/health":
             return self._send(200, {
@@ -187,7 +268,13 @@ class Handler(BaseHTTPRequestHandler):
                     "example": "/worklist?as_of=2024-06-01&capacity=50"})
             capacity = int((q.get("capacity") or ["50"])[0])
             lookback = int((q.get("lookback_days") or ["30"])[0])
-            return self._send(200, self._worklist(as_of, capacity, lookback))
+            body = self._worklist(as_of, capacity, lookback)
+            ACCESS.log(route="/worklist",
+                       caller=self.headers.get("X-Caller", "anonymous-token"),
+                       as_of=as_of,
+                       member_ids=[r["member_id"] for r in body["worklist"]],
+                       outcome="success")
+            return self._send(200, body)
 
         return self._send(404, {"error": f"no route {url.path}",
                                 "routes": ["/health", "/model", "/worklist",
@@ -196,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- POST -----------------------------------------------------------
     def do_POST(self):
         url = urlparse(self.path)
+        if not self._authorised(url.path):
+            return
         if url.path != "/score":
             return self._send(404, {"error": f"no route {url.path}"})
         model = _STATE["model"]
@@ -222,7 +311,13 @@ class Handler(BaseHTTPRequestHandler):
         if not ids:
             return self._send(400, {"error": "stay_ids is required"})
         lookback = int(body.get("lookback_days", 30))
-        return self._send(200, self._score(ids, as_of, lookback))
+        out = self._score(ids, as_of, lookback)
+        ACCESS.log(route="/score",
+                   caller=self.headers.get("X-Caller", "anonymous-token"),
+                   as_of=as_of,
+                   member_ids=[r["member_id"] for r in out["scored"]],
+                   outcome="success")
+        return self._send(200, out)
 
     # -- work -----------------------------------------------------------
     def _frame_as_of(self, as_of, lookback_days=30):
