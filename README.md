@@ -21,7 +21,8 @@ python serve.py --register                # fit and register a servable artefact
 python serve.py --demo                    # exercise the API end to end
 python serve.py                           # scoring service on :8081
 python run_batch.py                       # overnight batch + fairness report
-python -m pytest tests -q                 # 100 tests, all about not cheating
+python -m pytest tests -q                 # 106 tests, all about not cheating
+python validate_reasons.py                # occlusion vs real SHAP -> docs/
 ```
 
 Everything runs offline. Runtime end to end is about ten minutes, most of
@@ -391,24 +392,87 @@ that is the question an investigation asks. Denied attempts are logged too. A
 consequence worth stating: the log contains member ids, so *the log is PHI*,
 with the same handling requirements as the scores.
 
+## The reason codes are measured against real SHAP
+
+`worklist.py` computes its "top drivers" by OCCLUSION — set one feature to its
+cohort median, re-score, record the drop — and its docstring has always said
+this is **not SHAP**. That was honest but unquantified. SHAP is installed, so
+`validate_reasons.py` measures the gap on the decision the worklist actually
+makes.
+
+Both methods are restricted to the **same candidate set**, so this compares
+attribution methods rather than candidate filters. Over 200 members from the
+top of the worklist:
+
+| question | answer |
+|---|---|
+| same **top-1** driver | **68.0%** |
+| **top-3 set** identical (order ignored) | **39.5%** |
+| mean top-3 overlap | **2.38 of 3** |
+| mean rank correlation across candidates | **0.893** |
+| mean additivity violation | **0.187** probability |
+
+Rank correlation is high while top-3 set agreement is not, and that is not a
+contradiction: most candidates are ordered the same and **the disagreements
+concentrate at the top** — which is exactly the part that gets displayed.
+
+### The disagreement is systematic, and it points one way
+
+| feature | occlusion calls it #1 | SHAP calls it #1 |
+|---|---|---|
+| `ip_days_365d` | 85 | 74 |
+| `paid_amount_365d` | 61 | **94** |
+| `charlson` | **26** | 5 |
+| `age` | 18 | 13 |
+| `los` | 3 | **12** |
+
+**Occlusion over-credits `charlson` by 5× and under-credits prior spend.**
+`charlson` is a composite comorbidity index correlated with the utilisation
+features. Setting it alone to the cohort median leaves a member who is
+comorbidity-free but expensive and frequently admitted — a combination that
+exists nowhere in the data. The model's response to that off-manifold point
+gets booked entirely to `charlson`, where Shapley values split the shared
+credit.
+
+This is the interaction-blindness the docstring predicted, appearing in the
+direction it predicted.
+
+### Why the direction matters more than the percentage
+
+"High comorbidity burden" and "a lot of recent inpatient days" are not
+interchangeable phrases — they suggest **different phone calls**, the first
+pointing at disease management and the second at discharge follow-up and
+access. A wrong ranking does not merely misattribute; it can misdirect the
+outreach.
+
+The audit does not upgrade occlusion into an appeal-grade explanation, and the
+additivity violation of 0.187 is far too large to let these be read as "how
+much this feature contributed". What changed is that the limitation is a number
+instead of a promise.
+
 ## What is still missing, and why it cannot be closed here
 
 Everything below needs something this environment does not have. The gaps that
 were closeable have been closed; these are named with the specific blocker
 rather than left as a to-do.
 
-- **No real Synthea.** Not installed, no network. `src/generate.py` writes
+- **No real Synthea.** Blocked by a **missing Java runtime**, not by the
+  network — an earlier version of this list said "no network", which was wrong.
+  `src/generate.py` writes
   claims-shaped data directly, so the trajectories come from a risk equation I
   wrote — which is what makes recovery checkable and also what makes the
   clinical realism unearned.
-- **No SHAP.** Not installed. Reason codes use occlusion-vs-median, documented
-  at length in `worklist.py` as *not SHAP* — not additive, blind to
-  interactions, no efficiency guarantee. Anything a member could appeal needs
-  real Shapley values.
-- **No MLflow or artefact store.** `src/registry.py` is the minimum that makes
-  serving honest — an artefact bound to its feature contract. No experiment
-  tracking, no lineage to the training run, no staging/production promotion, no
-  approval gates.
+- **The shipped reason codes are still occlusion, not SHAP** — and that is now
+  a *measured* limitation rather than a disclaimed one (see the audit above).
+  SHAP is installed; an earlier version of this list claimed it was not. The
+  worklist keeps occlusion because `worklist.py` has no third-party dependency,
+  and anything a member could appeal still needs real Shapley values.
+- **No experiment tracking or artefact store.** `src/registry.py` is the
+  minimum that makes serving honest — an artefact bound to its feature
+  contract. No lineage to the training run, no staging/production promotion, no
+  approval gates. **This one is not blocked**: MLflow is installed, and this is
+  a scoping decision to keep `src/` dependency-free, listed here so it is not
+  mistaken for something that could not be done.
 - **No scheduler.** `run_batch.py` runs one job when invoked; something else
   has to invoke it, and "the batch did not run at all" is the failure that most
   needs monitoring. It is in the policy table as `external: True` precisely
@@ -461,6 +525,8 @@ rather than left as a to-do.
 | `src/alerting.py` | thresholds with owners and silence rules; generates the runbook |
 | `run_batch.py` | the overnight batch, and the fairness report |
 | `docs/RUNBOOK.md` | generated from the policy, so the two cannot drift |
+| `validate_reasons.py` | occlusion vs shap.TreeExplainer; found the charlson bias |
+| `tests/test_reason_audit.py` | 6 tests pinning the SIZE of the gap, not its absence |
 | `tests/test_complete.py` | 33 tests: reruns, partial failure, parity, alert routing, auth |
 | `tests/test_guard.py` | 20 tests: not cheating, and not overstating precision |
 | `tests/test_serving.py` | 27 tests: the feature contract and the drift detectors |
