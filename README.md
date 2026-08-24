@@ -1,4 +1,4 @@
-# ML-1 — Claims-based readmission risk — complete
+# ML-1 — Claims-based readmission risk — working system, 9 known gaps
 
 **This is still not a deployable system.** It is the load-bearing part of one:
 the claims feature craft, the temporal discipline, the intervention framing,
