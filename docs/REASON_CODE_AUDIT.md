@@ -15,11 +15,11 @@ compares attribution methods, not candidate filters.
 
 | question | answer |
 |---|---|
-| same **top-1** driver | **68.0%** |
-| **top-3 set** identical (order ignored) | **39.5%** |
-| mean top-3 overlap | **2.38 of 3** |
-| mean rank correlation across candidates | **0.893** |
-| mean additivity violation | **0.1870** probability |
+| same **top-1** driver | **97.0%** |
+| **top-3 set** identical (order ignored) | **41.5%** |
+| mean top-3 overlap | **2.34 of 3** |
+| mean rank correlation across candidates | **0.845** |
+| mean additivity violation | **0.1101** probability |
 
 ## What the two numbers mean, and why both are reported
 
@@ -38,24 +38,58 @@ never be presented as "how much this feature contributed".
 The **rank agreement** is the honest answer to the second. It is the property
 the worklist actually relies on.
 
-## The disagreement is SYSTEMATIC, not noise
+## AGREEMENT DEPENDS ON HOW CONCENTRATED THE ATTRIBUTION IS
+
+**This is a correction to an earlier version of this document**, and it is the
+most useful thing here.
+
+A previous run reported 68% top-1 agreement and a large `charlson` bias, and
+wrote it up as a property of occlusion. Regenerating the data changed the
+model, and the same audit then reported **97% agreement with no `charlson`
+bias at all**. The method did not change. The data did.
+
+The mechanism is attribution CONCENTRATION -- the share of members whose top
+driver is the single most common feature:
+
+| | concentration | top-1 agreement |
+|---|---|---|
+| earlier corpus | 43% (`ip_days_365d` 85 of 200) | 68% |
+| this corpus | 92% (one feature dominates) | 97.0% |
+
+When one feature dominates, both methods pick it and agreement is close to
+free. When attribution is SPREAD across several correlated features, occlusion
+diverges -- because that is exactly when setting one feature to its median
+produces an off-manifold member, and occlusion books the model's whole reaction
+to that impossible combination against the feature it moved.
+
+Two corpora is two data points, not a curve, and the relationship is stated as
+a mechanism rather than a law. But it does mean the honest headline is **not**
+"occlusion agrees 97% of the time" -- it is "agreement is high here because
+one feature dominates, and would fall again on a model with spread
+attribution".
+
+The **additivity violation does not depend on any of this**: occlusion has no
+efficiency guarantee in either regime, which is why these values must never be
+presented as "how much this feature contributed".
+
+## The disagreement, and whether it is directional
 
 The two methods do not merely differ at random. They differ in a consistent
 direction, which is what makes it worth acting on:
 
 | feature | occlusion calls it #1 | SHAP calls it #1 |
 |---|---|---|
-| `ip_days_365d` | 85 | 74 |
-| `paid_amount_365d` | 61 | 94 |
-| `charlson` | 26 | 5 |
-| `age` | 18 | 13 |
-| `los` | 3 | 12 |
-| `ccsr_CIR019` | 2 | 1 |
-| `distinct_providers_180d` | 3 | 0 |
-| `rx_classes_180d` | 1 | 0 |
+| `paid_amount_365d` | 182 | 184 |
+| `los` | 10 | 13 |
+| `charlson` | 3 | 3 |
+| `age` | 5 | 0 |
 
-**Occlusion over-credits `charlson` and under-credits prior utilisation.**
-That is the expected failure mode of the method rather than a surprise.
+On the earlier corpus, occlusion over-credited `charlson` 26 to 5 while
+under-crediting prior spend 61 to 94. On this corpus the two agree closely,
+because attribution is concentrated. **The bias is a property of the
+data-and-model, not of occlusion alone.**
+
+Where it does appear, the mechanism is the expected one rather than a surprise.
 `charlson` is a composite comorbidity index, correlated with inpatient days and
 spend. Setting it alone to the cohort median, while leaving the utilisation
 features at their actual high values, produces a member who exists nowhere in

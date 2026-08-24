@@ -319,8 +319,43 @@ def generate(n_members=50000, seed=7, outdir="data"):
 
     p = _sigmoid(admits["_z"].values)
     died = rng.random(len(admits)) < np.clip(0.010 + 0.055 * p, 0, 0.30)
-    readmit = (rng.random(len(admits)) < p) & (~died)
+
+    # -- THE COMPETING RISK -------------------------------------------------
+    # A patient who dies at home on day 10 did not "fail to be readmitted".
+    # They were only at risk for ten of the thirty days, and then they were not
+    # at risk at all. Labelling them 0 counts a death as a good outcome.
+    #
+    # Post-discharge mortality is drawn from the SAME risk score as
+    # readmission, which is what makes it a competing risk rather than
+    # nuisance censoring: the patients removed from the risk set are exactly
+    # the ones most likely to have been readmitted. Independent censoring
+    # would be harmless in expectation; this is not.
+    #
+    # LATENT readmission (`true_readmit_30d`) is what would have happened with
+    # nobody dying. OBSERVED readmission is what the data can actually see.
+    # Keeping both is the only way to measure the distortion rather than
+    # asserting it.
+    latent_readmit = (rng.random(len(admits)) < p) & (~died)
+    # Calibrated to a defensible 30-day post-discharge mortality for an acute
+    # medical cohort -- a few percent overall, rising steeply with risk. The
+    # first draft used a much flatter curve, produced 1.1% overall, and made
+    # the competing risk look like a rounding error rather than a real one.
+    p_death_post = np.clip(0.012 + 0.160 * p, 0, 0.35)
+    dies_post = (rng.random(len(admits)) < p_death_post) & (~died)
+    death_day = rng.integers(1, 31, len(admits))
+    readmit_day = rng.integers(2, 30, len(admits))
+
+    # death wins only if it happens FIRST; a readmission on day 5 followed by
+    # death on day 20 is an observed readmission
+    censored_by_death = dies_post & latent_readmit & (death_day < readmit_day)
+    readmit = latent_readmit & ~censored_by_death
+
     admits["died_inpatient"] = died
+    admits["died_post_discharge_30d"] = dies_post
+    admits["death_day_post"] = np.where(dies_post, death_day, -1)
+    admits["readmit_day"] = np.where(latent_readmit, readmit_day, -1)
+    admits["latent_readmit_30d"] = latent_readmit
+    admits["censored_by_death"] = censored_by_death
     admits["true_readmit_30d"] = readmit
     admits["true_p"] = p
 
@@ -332,8 +367,10 @@ def generate(n_members=50000, seed=7, outdir="data"):
             disp[j] = "20"
             continue
         if r.true_readmit_30d:
-            # the readmit stay itself
-            gapdays = int(rng.integers(2, 30))
+            # the readmit stay itself. The gap is the one the competing-risk
+            # race was decided on, not a fresh draw -- drawing again here would
+            # let a stay be readmitted on a day the patient was already dead.
+            gapdays = int(r.readmit_day)
             adm2 = r.discharge_date + _days(gapdays)
             los2 = int(np.clip(rng.gamma(2.0, 2.4) + 1, 1, 40))
             extra.append({
@@ -357,6 +394,12 @@ def generate(n_members=50000, seed=7, outdir="data"):
         admits["planned"] = admits["planned"].fillna(False).astype(bool)
         admits["died_inpatient"] = admits["died_inpatient"].fillna(False).astype(bool)
         admits["true_readmit_30d"] = admits["true_readmit_30d"].fillna(False).astype(bool)
+        for col, fill in (("died_post_discharge_30d", False),
+                          ("latent_readmit_30d", False),
+                          ("censored_by_death", False)):
+            admits[col] = admits[col].fillna(fill).astype(bool)
+        for col in ("death_day_post", "readmit_day"):
+            admits[col] = admits[col].fillna(-1).astype(int)
     admits = admits.sort_values(["member_id", "admit_date"]).reset_index(drop=True)
     admits["stay_id"] = [f"S{i:08d}" for i in range(len(admits))]
 
@@ -416,6 +459,9 @@ def generate(n_members=50000, seed=7, outdir="data"):
     print(f"  index-eligible   {len(idx):,}")
     print(f"  readmit rate     {idx.true_readmit_30d.mean():.1%}")
     print(f"  died inpatient   {idx.died_inpatient.mean():.1%}")
+    print(f"  died post-dc 30d {idx.died_post_discharge_30d.mean():.1%}")
+    print(f"  censored by death {idx.censored_by_death.mean():.2%}  "
+          f"(latent readmissions the data cannot see)")
     print(f"median runout lag  facility {np.median(lag[facility]):.0f}d / "
           f"professional {np.median(lag[~facility]):.0f}d")
     return medical, pharmacy, eligibility, members, admits

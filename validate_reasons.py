@@ -185,6 +185,11 @@ def compare(n=300):
         "disagreements": disagreements,
         "occ_top1": occ_top1,
         "shap_top1": shap_top1,
+        # HOW CONCENTRATED IS THE ATTRIBUTION? The share of members whose top
+        # driver is the single most common one. This turns out to govern
+        # everything else -- see the note in the report.
+        "concentration": (shap_top1.most_common(1)[0][1] / n_cmp)
+        if n_cmp and shap_top1 else float("nan"),
     }
 
 
@@ -212,6 +217,8 @@ def main():
     print("  top-3 mean overlap          %.2f of 3" % (3 * r["top3_overlap"]))
     print("  mean rank correlation       %.3f" % r["rank_rho"])
     print("  mean additivity violation   %.4f probability" % r["additivity_gap"])
+    print("  attribution concentration   %.1f%% (top feature's share of picks)"
+          % (100 * r["concentration"]))
     print("=" * 72)
     print("  which feature each method calls the TOP driver:")
     print("    %-24s %10s %6s" % ("feature", "occlusion", "shap"))
@@ -264,15 +271,53 @@ never be presented as "how much this feature contributed".
 The **rank agreement** is the honest answer to the second. It is the property
 the worklist actually relies on.
 
-## The disagreement is SYSTEMATIC, not noise
+## AGREEMENT DEPENDS ON HOW CONCENTRATED THE ATTRIBUTION IS
+
+**This is a correction to an earlier version of this document**, and it is the
+most useful thing here.
+
+A previous run reported 68%% top-1 agreement and a large `charlson` bias, and
+wrote it up as a property of occlusion. Regenerating the data changed the
+model, and the same audit then reported **97%% agreement with no `charlson`
+bias at all**. The method did not change. The data did.
+
+The mechanism is attribution CONCENTRATION -- the share of members whose top
+driver is the single most common feature:
+
+| | concentration | top-1 agreement |
+|---|---|---|
+| earlier corpus | 43%% (`ip_days_365d` 85 of 200) | 68%% |
+| this corpus | %.0f%% (one feature dominates) | %.1f%% |
+
+When one feature dominates, both methods pick it and agreement is close to
+free. When attribution is SPREAD across several correlated features, occlusion
+diverges -- because that is exactly when setting one feature to its median
+produces an off-manifold member, and occlusion books the model's whole reaction
+to that impossible combination against the feature it moved.
+
+Two corpora is two data points, not a curve, and the relationship is stated as
+a mechanism rather than a law. But it does mean the honest headline is **not**
+"occlusion agrees 97%% of the time" -- it is "agreement is high here because
+one feature dominates, and would fall again on a model with spread
+attribution".
+
+The **additivity violation does not depend on any of this**: occlusion has no
+efficiency guarantee in either regime, which is why these values must never be
+presented as "how much this feature contributed".
+
+## The disagreement, and whether it is directional
 
 The two methods do not merely differ at random. They differ in a consistent
 direction, which is what makes it worth acting on:
 
 %s
 
-**Occlusion over-credits `charlson` and under-credits prior utilisation.**
-That is the expected failure mode of the method rather than a surprise.
+On the earlier corpus, occlusion over-credited `charlson` 26 to 5 while
+under-crediting prior spend 61 to 94. On this corpus the two agree closely,
+because attribution is concentrated. **The bias is a property of the
+data-and-model, not of occlusion alone.**
+
+Where it does appear, the mechanism is the expected one rather than a surprise.
 `charlson` is a composite comorbidity index, correlated with inpatient days and
 spend. Setting it alone to the cohort median, while leaving the utilisation
 features at their actual high values, produces a member who exists nowhere in
@@ -301,6 +346,7 @@ on this cohort -- it does not make it stop being true.
 What has changed is that the limitation is now a number instead of a promise.
 """ % (r["n"], 100 * r["top1_agreement"], 100 * r["top3_exact"],
        3 * r["top3_overlap"], r["rank_rho"], r["additivity_gap"],
+       100 * r["concentration"], 100 * r["top1_agreement"],
        _top1_table(r)))
     print("wrote", path)
 

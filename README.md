@@ -21,7 +21,8 @@ python serve.py --register                # fit and register a servable artefact
 python serve.py --demo                    # exercise the API end to end
 python serve.py                           # scoring service on :8081
 python run_batch.py                       # overnight batch + fairness report
-python -m pytest tests -q                 # 106 tests, all about not cheating
+python -m pytest tests -q                 # 118 tests, all about not cheating
+python run_competing_risks.py             # death as a competing risk -> docs/
 python validate_reasons.py                # occlusion vs real SHAP -> docs/
 ```
 
@@ -401,54 +402,122 @@ this is **not SHAP**. That was honest but unquantified. SHAP is installed, so
 makes.
 
 Both methods are restricted to the **same candidate set**, so this compares
-attribution methods rather than candidate filters. Over 200 members from the
-top of the worklist:
+attribution methods rather than candidate filters.
 
-| question | answer |
-|---|---|
-| same **top-1** driver | **68.0%** |
-| **top-3 set** identical (order ignored) | **39.5%** |
-| mean top-3 overlap | **2.38 of 3** |
-| mean rank correlation across candidates | **0.893** |
-| mean additivity violation | **0.187** probability |
+### A correction, and it is the most useful part
 
-Rank correlation is high while top-3 set agreement is not, and that is not a
-contradiction: most candidates are ordered the same and **the disagreements
-concentrate at the top** — which is exactly the part that gets displayed.
+An earlier version of this section reported **68% top-1 agreement** and a large
+`charlson` bias, and presented both as properties of occlusion. Regenerating
+the data changed the model, and the same audit then reported **97% agreement
+with no `charlson` bias at all**. The method did not change. The data did.
 
-### The disagreement is systematic, and it points one way
+Two tests failed when that happened, which is exactly what they were for.
 
-| feature | occlusion calls it #1 | SHAP calls it #1 |
+The mechanism is attribution **concentration** — the share of members whose top
+driver is the single most common feature:
+
+| corpus | concentration | top-1 agreement |
 |---|---|---|
-| `ip_days_365d` | 85 | 74 |
-| `paid_amount_365d` | 61 | **94** |
-| `charlson` | **26** | 5 |
-| `age` | 18 | 13 |
-| `los` | 3 | **12** |
+| earlier | 43% (`ip_days_365d`, 85 of 200) | 68% |
+| current | **92%** (`paid_amount_365d`, 184 of 200) | **97%** |
 
-**Occlusion over-credits `charlson` by 5× and under-credits prior spend.**
-`charlson` is a composite comorbidity index correlated with the utilisation
-features. Setting it alone to the cohort median leaves a member who is
-comorbidity-free but expensive and frequently admitted — a combination that
-exists nowhere in the data. The model's response to that off-manifold point
-gets booked entirely to `charlson`, where Shapley values split the shared
-credit.
+When one feature dominates, both methods pick it and agreement is nearly free.
+When attribution is **spread across correlated features**, occlusion diverges —
+because that is precisely when setting one feature to its median produces an
+off-manifold member, and occlusion books the model's whole reaction to that
+impossible combination against the feature it moved.
 
-This is the interaction-blindness the docstring predicted, appearing in the
-direction it predicted.
+Two corpora is two data points, not a curve. But the honest headline is **not**
+"occlusion agrees 97% of the time" — it is *"agreement is high here because one
+feature dominates, and would fall again on a model with spread attribution."*
 
-### Why the direction matters more than the percentage
+### What does not depend on the corpus
 
-"High comorbidity burden" and "a lot of recent inpatient days" are not
-interchangeable phrases — they suggest **different phone calls**, the first
-pointing at disease management and the second at discharge follow-up and
-access. A wrong ranking does not merely misattribute; it can misdirect the
-outreach.
+| question | current corpus |
+|---|---|
+| **top-3 set** identical (order ignored) | 41.5% |
+| mean top-3 overlap | 2.34 of 3 |
+| mean rank correlation | 0.845 |
+| **mean additivity violation** | **0.110** probability |
 
-The audit does not upgrade occlusion into an appeal-grade explanation, and the
-additivity violation of 0.187 is far too large to let these be read as "how
-much this feature contributed". What changed is that the limitation is a number
-instead of a promise.
+The top-3 claim survived the corpus change where the top-1 claim did not, which
+is informative in itself: agreeing on the single strongest driver is much easier
+than agreeing on the ordering below it.
+
+The **additivity violation** holds in every regime. Occlusion has no efficiency
+guarantee, and 0.110 on a probability scale is far too large to let these values
+be read as *"how much this feature contributed"* — which is why `worklist.py`
+phrases them as sensitivity rather than contribution.
+
+Where the `charlson` bias does appear, it matters because "high comorbidity
+burden" and "a lot of recent inpatient days" suggest **different phone calls** —
+the first pointing at disease management, the second at discharge follow-up. A
+wrong ranking does not merely misattribute; it can misdirect the outreach.
+
+## Death after discharge is a competing risk, not a non-event
+
+A patient who dies at home on day 10 did not *fail to be readmitted*. They were
+at risk for ten of the thirty days and then not at risk at all. Labelling them
+`y = 0` counts a death as a good outcome, and a model trained on that label
+learns to treat *about to die* as *low risk*.
+
+This gap previously read "post-discharge mortality is not in the generator, so
+there is nothing here to recover". It is in the generator now — drawn from the
+**same risk score as readmission**, which is what makes it a *competing* risk
+rather than nuisance censoring: the patients removed from the risk set are
+precisely the ones most likely to have been readmitted.
+
+```bash
+python run_competing_risks.py
+```
+
+| readmission rate | |
+|---|---|
+| **naive** — a death counts as `y = 0` | 0.1612 |
+| **exclude** — drop the deaths | 0.1635 |
+| **latent truth** — nobody dies | **0.1649** |
+
+Naive understates by **0.37 pp**, excluding by **0.14 pp**. `latent` is not
+observable in real data; it exists here only because the generator recorded
+what *would* have happened.
+
+### Why excluding the deaths is also wrong
+
+Dropping them looks like the conservative move. It is **informative
+censoring** — the patients who die carry higher readmission risk than those who
+survive:
+
+| | mean true risk |
+|---|---|
+| died post-discharge | 0.1978 |
+| survived 30 days | 0.1640 |
+| **ratio** | **1.21×** |
+
+So excluding deaths fits the model on a **healthier population than the one it
+will score**. 9.9% of the post-discharge deaths would have been readmitted.
+
+### When does it actually matter?
+
+At this cohort's 3.7% mortality the bias is a few tenths of a percentage point
+— real, measurable, and **small**. Saying so is more useful than making it
+sound alarming.
+
+| post-discharge mortality | naive rate | latent rate | naive bias |
+|---|---|---|---|
+| 1.2% | 0.1638 | 0.1649 | −0.11 pp |
+| 3.8% | 0.1608 | 0.1649 | −0.41 pp |
+| 8.9% | 0.1557 | 0.1649 | −0.92 pp |
+| 14.3% | 0.1503 | 0.1649 | **−1.46 pp** |
+
+**The bias scales with mortality**, which is the actionable form. A general
+medical cohort at ~4% can mostly ignore it. A heart-failure or oncology cohort,
+where 30-day post-discharge mortality runs several times higher, cannot — and
+the direction never changes: **the model is trained to believe the sickest
+patients are safer than they are.**
+
+The sweep resamples mortality against the stored true risk rather than
+regenerating the corpus, so every other source of variation is held fixed. A
+regeneration sweep would measure generator noise alongside the effect.
 
 ## What is still missing, and why it cannot be closed here
 
@@ -486,11 +555,13 @@ rather than left as a to-do.
   off as a property of the model. Detecting it needs an external measure of
   health that does not come through the claims pipeline, which is a
   data-acquisition problem.
-- **No competing-risk handling.** Death after discharge censors the outcome and
-  is handled only by excluding in-hospital deaths. Post-discharge mortality is
-  not in the generator, so as with access bias there is nothing here to
-  recover; `data3-trial-survival` in this portfolio has the Aalen-Johansen and
-  Fine-Gray machinery this would need.
+- **The competing risk is measured, not corrected.** Post-discharge mortality
+  is in the generator now and the distortion is quantified (see above), but
+  there is no Fine-Gray or cause-specific model here.
+  `data3-trial-survival` has the Aalen-Johansen and Fine-Gray machinery, and
+  wiring the two together is still undone. The right production answer is
+  usually a composite outcome (readmission **or** death), which changes what
+  the model is *for* — a product decision, not a modelling one.
 - **Single-node, single-process.** No TLS, no rate limiting, no connection
   pooling. The bearer token authenticates a caller, not a user, and
   `se1-hl7-fhir-interop` has the SMART scope layer and append-only audit this
@@ -526,6 +597,8 @@ rather than left as a to-do.
 | `run_batch.py` | the overnight batch, and the fairness report |
 | `docs/RUNBOOK.md` | generated from the policy, so the two cannot drift |
 | `validate_reasons.py` | occlusion vs shap.TreeExplainer; found the charlson bias |
+| `run_competing_risks.py` | the death-as-non-event distortion, and when it matters |
+| `tests/test_competing_risks.py` | 12 tests on the structure of the bias |
 | `tests/test_reason_audit.py` | 6 tests pinning the SIZE of the gap, not its absence |
 | `tests/test_complete.py` | 33 tests: reruns, partial failure, parity, alert routing, auth |
 | `tests/test_guard.py` | 20 tests: not cheating, and not overstating precision |
